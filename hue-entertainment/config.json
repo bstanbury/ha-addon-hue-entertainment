@@ -1,12 +1,12 @@
 {
   "name": "Hue Entertainment Bridge",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "slug": "hue_entertainment",
-  "description": "Immersive lighting — movie mode, music sync, ambient presets via Hue Bridge.",
+  "description": "Event-driven immersive lighting — auto-movie mode, golden hour, time-based transitions.",
   "url": "https://github.com/bstanbury/ha-addon-hue-entertainment",
   "arch": ["aarch64","amd64","armhf","armv7","i386"],
   "startup": "application","boot": "auto","init": false,"host_network": true,
-  "options": {"bridge_ip":"","api_key":"","api_port":8096,"ha_url":"http://localhost:8123","ha_token":""},
-  "schema": {"bridge_ip":"str","api_key":"str","api_port":"int","ha_url":"str","ha_token":"str"},
+  "options": {"bridge_ip":"","api_key":"","api_port":8096,"ha_url":"http://localhost:8123","ha_token":"","event_bus_url":"http://localhost:8092"},
+  "schema": {"bridge_ip":"str","api_key":"str","api_port":"int","ha_url":"str","ha_token":"str","event_bus_url":"str"},
   "panel_icon": "mdi:lightbulb-group"
 }
