@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
-"""Hue Entertainment Bridge v2.0.0
+"""Hue Entertainment Bridge v3.0.0
 Immersive lighting with Event Bus integration and time-based auto-transitions.
+
+v3.0 additions:
+  - Bedroom protection: never change bedroom lights after 9pm unless motion confirmed
+  - Cooper-safe presets: warm, gentle lighting when Cooper is visiting
+  - Bedroom/Echo entity constants for cross-addon safety
+  - Silent hours awareness (22:00-08:00)
 
 v2.0 additions:
   - Event Bus SSE subscriber: reacts to events in real-time
@@ -15,6 +21,7 @@ Endpoints:
   POST /scene/<name>, /movie, /music/<energy>, /ambient/<preset>
   POST /all/off, /all/on, /room/<room>/<scene>
   POST /light/<id>/set?on=true&bri=200&ct=300
+  POST /cooper-safe — v3.0: Apply Cooper-safe preset
   GET  /event-log — Recent event-driven actions
   GET  /auto-mode — Current auto-transition state
 """
@@ -37,8 +44,29 @@ app=Flask(__name__)
 logging.basicConfig(level=logging.INFO,format='%(asctime)s %(levelname)s %(message)s')
 logger=logging.getLogger('hue-entertainment')
 
-# v2.0: State tracking
-current_mode='auto'  # auto, movie, manual
+# v3.0: Safety constants
+BEDROOM_ENTITIES = lambda eid: 'bedroom' in eid.lower()
+ECHO_ENTITIES = [
+    'media_player.living_room_echo_show',
+    'media_player.kitchen_echo_show',
+    'media_player.bedroom_echo',
+]
+SILENT_HOURS = lambda: datetime.now().hour >= 22 or datetime.now().hour < 8
+BEDROOM_LIGHT_CURFEW = lambda: datetime.now().hour >= 21 or datetime.now().hour < 8
+
+def is_bedroom_safe():
+    """v3.0: Check if bedroom motion is active."""
+    try:
+        r = http.get(f'{HA_URL}/api/states/binary_sensor.bedroom_motion', headers={'Authorization': f'Bearer {HA_TOKEN}'}, timeout=5)
+        if r.status_code == 200: return r.json().get('state') == 'on'
+    except: pass
+    return False
+
+def is_bedroom_light(light_name):
+    """v3.0: Check if a Hue light name suggests it's a bedroom light."""
+    return 'bedroom' in light_name.lower() or 'bed room' in light_name.lower()
+
+current_mode='auto'
 last_auto_preset=None
 event_actions=deque(maxlen=100)
 DATA_FILE='/data/hue_state.json'
@@ -52,14 +80,16 @@ PRESETS={
   'candlelight':[{'bri':80,'xy':[0.55,0.4]},{'bri':60,'xy':[0.58,0.38]},{'bri':70,'xy':[0.52,0.41]},{'bri':50,'xy':[0.56,0.39]}],
   'neon':[{'bri':254,'xy':[0.35,0.15]},{'bri':254,'xy':[0.15,0.06]},{'bri':254,'xy':[0.2,0.5]},{'bri':254,'xy':[0.55,0.35]}],
   'golden_hour':[{'bri':200,'xy':[0.52,0.41]},{'bri':180,'xy':[0.5,0.4]},{'bri':160,'xy':[0.48,0.39]},{'bri':140,'xy':[0.53,0.4]}],
+  # v3.0: Cooper-safe presets
+  'cooper_day':[{'bri':200,'xy':[0.45,0.41]},{'bri':180,'xy':[0.44,0.4]},{'bri':160,'xy':[0.43,0.39]},{'bri':190,'xy':[0.46,0.4]}],
+  'cooper_night':[{'bri':120,'xy':[0.50,0.40]},{'bri':100,'xy':[0.52,0.39]},{'bri':80,'xy':[0.48,0.38]},{'bri':110,'xy':[0.51,0.40]}],
 }
 
-# Time-based auto-transitions
 TIME_PRESETS={
-    (14,17):'ocean',      # afternoon: cool/productive
-    (17,19):'sunset',     # golden hour
-    (19,21):'candlelight', # evening wind-down
-    (21,23):'candlelight', # night (dimmer)
+    (14,17):'ocean',
+    (17,19):'sunset',
+    (19,21):'candlelight',
+    (21,23):'candlelight',
 }
 
 def load_state():
@@ -84,36 +114,41 @@ def hue_put(p,d):
     except Exception as e: return {'error':str(e)}
 
 def apply_preset(preset_name, transition=10):
-    """Apply a preset to all reachable lights."""
     global last_auto_preset
-    if preset_name not in PRESETS:
-        return False
+    if preset_name not in PRESETS: return False
     cs=PRESETS[preset_name]
-    lids=[lid for lid,l in hue_get('/lights').items() if l['state'].get('reachable')]
+    lights=hue_get('/lights')
+    lids=[lid for lid,l in lights.items() if l['state'].get('reachable')]
     for i,lid in enumerate(lids):
+        light_name = lights[lid].get('name', '')
+        # v3.0: Skip bedroom lights during curfew unless motion confirmed
+        if BEDROOM_LIGHT_CURFEW() and is_bedroom_light(light_name):
+            if not is_bedroom_safe():
+                logger.info(f'BEDROOM PROTECTION: Skipping {light_name} (curfew, no motion)')
+                continue
         hue_put(f'/lights/{lid}/state',{'on':True,**cs[i%len(cs)],'transitiontime':transition})
     last_auto_preset=preset_name
     save_state()
     return True
 
 def handle_event(ev):
-    """v2.0: React to Event Bus events in real-time."""
     global current_mode
     eid=ev.get('entity_id','')
     new=ev.get('new_state','')
     old=ev.get('old_state','')
     sig=ev.get('significant',False)
-    
     action=None
-    
+
     # TV on = auto-movie mode
     if 'media_player.75_the_frame' in eid or ('media_player' in eid and 'frame' in eid):
         if new in ['on','playing'] and old in ['off','standby','unavailable']:
             logger.info('EVENT: TV on — activating movie mode')
             current_mode='movie'
-            # Apply movie lighting
-            for lid,l in hue_get('/lights').items():
+            lights=hue_get('/lights')
+            for lid,l in lights.items():
                 n=l['name'].lower()
+                # v3.0: Skip bedroom lights
+                if is_bedroom_light(n) and not is_bedroom_safe(): continue
                 if any(k in n for k in ['tv','lightstrip','play','gradient']):
                     hue_put(f'/lights/{lid}/state',{'on':True,'bri':40,'ct':400,'transitiontime':20})
                 elif 'back' in n:
@@ -124,35 +159,33 @@ def handle_event(ev):
         elif new in ['off','standby'] and current_mode=='movie':
             logger.info('EVENT: TV off — restoring auto mode')
             current_mode='auto'
-            # Restore time-based preset
             h=datetime.now().hour
             for (start,end),preset in TIME_PRESETS.items():
                 if start<=h<end:
                     apply_preset(preset, transition=30)
                     break
             action='restore_auto_mode'
-    
-    # Sun state changes (golden hour)
+
     elif eid=='sun.sun':
         if new=='below_horizon' and current_mode=='auto':
             logger.info('EVENT: Sunset — golden hour preset')
-            apply_preset('golden_hour', transition=50)  # Slow 5-second transition
+            apply_preset('golden_hour', transition=50)
             action='golden_hour_sunset'
         elif new=='above_horizon' and current_mode=='auto':
             logger.info('EVENT: Sunrise — brightening')
-            # Bright, cool light for morning
-            for lid in list(hue_get('/lights').keys())[:6]:
+            lights=hue_get('/lights')
+            for lid in list(lights.keys())[:6]:
+                light_name = lights[lid].get('name', '')
+                if is_bedroom_light(light_name) and not is_bedroom_safe(): continue
                 hue_put(f'/lights/{lid}/state',{'on':True,'bri':200,'ct':250,'transitiontime':50})
             action='sunrise_brighten'
-    
-    # Weather change
+
     elif 'weather' in eid and sig:
         if new in ['rainy','pouring'] and current_mode=='auto':
             logger.info('EVENT: Rain — cozy candlelight')
             apply_preset('candlelight', transition=30)
             action='rainy_candlelight'
-    
-    # Presence
+
     elif 'presence' in eid:
         if new=='off':
             logger.info('EVENT: Departure — lights off')
@@ -161,19 +194,16 @@ def handle_event(ev):
         elif new=='on' and old=='off':
             logger.info('EVENT: Arrival — welcome lighting')
             h=datetime.now().hour
-            if h>=18 or h<6:
-                apply_preset('candlelight', transition=20)
-            else:
-                apply_preset('ocean', transition=20)
+            if h>=18 or h<6: apply_preset('candlelight', transition=20)
+            else: apply_preset('ocean', transition=20)
             current_mode='auto'
             action='arrival_welcome'
-    
+
     if action:
         event_actions.append({'time':datetime.now().isoformat(),'event':eid,'action':action,'old':old,'new':new})
         logger.info(f'ACTION: {action}')
 
 def event_bus_subscriber():
-    """v2.0: SSE subscriber thread."""
     while True:
         try:
             logger.info(f'Connecting to Event Bus SSE: {EVENT_BUS_URL}/events/stream')
@@ -184,17 +214,14 @@ def event_bus_subscriber():
                 try:
                     ev=json.loads(event.data)
                     handle_event(ev)
-                except json.JSONDecodeError:
-                    pass
-                except Exception as e:
-                    logger.error(f'Event handling error: {e}')
+                except json.JSONDecodeError: pass
+                except Exception as e: logger.error(f'Event handling error: {e}')
         except Exception as e:
             logger.error(f'Event Bus SSE error: {e}')
         logger.info('Reconnecting to Event Bus in 10s...')
         time.sleep(10)
 
 def time_transition_loop():
-    """v2.0: Background thread for time-based auto-transitions."""
     last_preset_applied=None
     while True:
         if current_mode=='auto':
@@ -202,15 +229,15 @@ def time_transition_loop():
             for (start,end),preset in TIME_PRESETS.items():
                 if start<=h<end and preset!=last_preset_applied:
                     logger.info(f'TIME: Auto-transition to {preset} (hour {h})')
-                    apply_preset(preset, transition=100)  # 10-second gradual transition
+                    apply_preset(preset, transition=100)
                     last_preset_applied=preset
                     event_actions.append({'time':datetime.now().isoformat(),'event':'time_transition','action':f'auto_{preset}','hour':h})
                     break
-        time.sleep(300)  # Check every 5 minutes
+        time.sleep(300)
 
 @app.route('/')
 def index():
-    return jsonify({'name':'Hue Entertainment Bridge','version':'2.0.0','bridge':BRIDGE_IP,'presets':list(PRESETS.keys()),'mode':current_mode,'last_preset':last_auto_preset,'lights':len(hue_get('/lights'))})
+    return jsonify({'name':'Hue Entertainment Bridge','version':'3.0.0','bridge':BRIDGE_IP,'presets':list(PRESETS.keys()),'mode':current_mode,'last_preset':last_auto_preset,'lights':len(hue_get('/lights'))})
 
 @app.route('/health')
 def health():
@@ -254,8 +281,10 @@ def scene(name):
 def movie():
     global current_mode
     current_mode='movie'
-    for lid,l in hue_get('/lights').items():
+    lights=hue_get('/lights')
+    for lid,l in lights.items():
         n=l['name'].lower()
+        if is_bedroom_light(n) and not is_bedroom_safe(): continue
         if any(k in n for k in ['tv','lightstrip','play','gradient']):
             hue_put(f'/lights/{lid}/state',{'on':True,'bri':40,'ct':400,'transitiontime':20})
         elif 'back' in n:
@@ -286,6 +315,15 @@ def ambient(preset):
     apply_preset(preset)
     current_mode='manual'
     return jsonify({'success':True,'preset':preset})
+
+# v3.0: Cooper-safe preset endpoint
+@app.route('/cooper-safe',methods=['POST','GET'])
+def cooper_safe():
+    h=datetime.now().hour
+    preset='cooper_day' if 8<=h<20 else 'cooper_night'
+    apply_preset(preset, transition=20)
+    logger.info(f'Cooper-safe: applied {preset}')
+    return jsonify({'success':True,'preset':preset,'hour':h})
 
 @app.route('/all/off',methods=['POST','GET'])
 def off():
@@ -333,13 +371,11 @@ def auto_mode():
     return jsonify({'mode':current_mode,'last_preset':last_auto_preset,'time_presets':TIME_PRESETS})
 
 if __name__=='__main__':
-    logger.info(f'Hue Entertainment Bridge v2.0.0 on :{API_PORT}')
+    logger.info(f'Hue Entertainment Bridge v3.0.0 on :{API_PORT}')
     load_state()
     c=hue_get('/config')
     logger.info(f'Bridge: {c.get("name","?")}'if c else'Bridge unreachable!')
-    # v2.0: Start Event Bus SSE subscriber
     threading.Thread(target=event_bus_subscriber,daemon=True).start()
-    # v2.0: Start time-based transition loop
     threading.Thread(target=time_transition_loop,daemon=True).start()
     logger.info('Event Bus subscriber + time transitions started')
     app.run(host='0.0.0.0',port=API_PORT,debug=False)
